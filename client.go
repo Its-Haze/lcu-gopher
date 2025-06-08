@@ -533,7 +533,7 @@ func (c *Client) Unsubscribe(endpoint string) error {
 //   - Failed to send subscription message via WebSocket
 //   - Failed to add the handler to the internal map
 func (c *Client) SubscribeToAll(handler EventHandler) error {
-	return c.Subscribe("OnJsonApiEvent", handler, EventTypeCreate, EventTypeUpdate, EventTypeDelete)
+	return c.Subscribe("/", handler, EventTypeCreate, EventTypeUpdate, EventTypeDelete)
 }
 
 // Private methods
@@ -623,6 +623,20 @@ func (c *Client) listenForEvents() {
 			}
 
 			if len(message) > 0 {
+				// First, pass the raw message to OnJsonApiEvent handlers
+				c.eventMux.RLock()
+				handlers := c.handlers["OnJsonApiEvent"]
+				c.eventMux.RUnlock()
+
+				for _, handler := range handlers {
+					go handler(&Event{
+						EventType: "WebSocketMessage",
+						URI:       "OnJsonApiEvent",
+						Data:      message,
+					})
+				}
+
+				// Then process specific events if it's an event message
 				if opcode, ok := message[0].(float64); ok {
 					switch opcode {
 					case 8: // EVENT
@@ -661,7 +675,10 @@ func (c *Client) handleEvent(message []interface{}) {
 
 	// If this is an OnJsonApiEvent, we want to use the URI from the event data
 	if eventName == "OnJsonApiEvent" {
+		// Get handlers for the specific URI
 		handlers = append(handlers, c.handlers[event.URI]...)
+		// Get handlers for the root path (which catches all events)
+		handlers = append(handlers, c.handlers["/"]...)
 	} else {
 		// Otherwise use the event name
 		handlers = append(handlers, c.handlers[eventName]...)
