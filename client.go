@@ -533,7 +533,7 @@ func (c *Client) Unsubscribe(endpoint string) error {
 //   - Failed to send subscription message via WebSocket
 //   - Failed to add the handler to the internal map
 func (c *Client) SubscribeToAll(handler EventHandler) error {
-	return c.Subscribe("OnJsonApiEvent", handler)
+	return c.Subscribe("OnJsonApiEvent", handler, EventTypeCreate, EventTypeUpdate, EventTypeDelete)
 }
 
 // Private methods
