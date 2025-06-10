@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -778,6 +779,9 @@ func findCredentialsFromProcess(config *Config) (*Credentials, error) {
 	switch runtime.GOOS {
 	case "windows":
 		cmd = exec.Command("wmic", "PROCESS", "WHERE", "name='LeagueClientUx.exe'", "GET", "commandline")
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			HideWindow: true,
+		}
 	case "darwin":
 		cmd = exec.Command("ps", "-A", "-o", "command", "|", "grep", "LeagueClientUx")
 	default:
