@@ -9,17 +9,16 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
+	gopsutilprocess "github.com/shirou/gopsutil/v4/process"
 )
 
 // Client represents a connection to the League Client API.
@@ -87,6 +86,10 @@ type Config struct {
 	// Custom path to League of Legends installation
 	// Example: "C:\\Riot Games\\League of Legends"
 	LeaguePath string
+
+	// ProcessLister overrides how the League Client process is discovered.
+	// Nil uses the native process table.
+	ProcessLister ProcessLister
 }
 
 // DefaultConfig returns a default configuration
@@ -692,16 +695,38 @@ func (c *Client) handleEvent(message []interface{}) {
 	}
 }
 
+// credentialMethod is one way of discovering LCU credentials.
+type credentialMethod struct {
+	name string
+	find func(*Config) (*Credentials, error)
+}
+
+// credentialMethods are tried in order. The process scan comes first because
+// it also back-fills LeaguePath, which the lockfile method then uses.
+var credentialMethods = []credentialMethod{
+	{"process", findCredentialsFromProcess},
+	{"lockfile", findCredentialsFromLockfile},
+}
+
 // findCredentials attempts to find LCU connection credentials
 func findCredentials(config *Config) (*Credentials, error) {
-	// Try lockfile method first
-	if creds, err := findCredentialsFromLockfile(config); err == nil {
-		return creds, nil
-	}
+	for _, method := range credentialMethods {
+		creds, err := method.find(config)
+		if err != nil {
+			if config.Debug {
+				config.Logger.Debug("connection", "%s discovery failed: %v", method.name, err)
+			}
+			continue
+		}
 
-	// Try process method
-	if creds, err := findCredentialsFromProcess(config); err == nil {
-		return creds, nil
+		// A crashed client leaves a stale lockfile behind, so credentials are
+		// only accepted once the API answers on them.
+		if checkLCUHealth(creds, config.Timeout, config.Logger) {
+			return creds, nil
+		}
+		if config.Debug {
+			config.Logger.Debug("connection", "%s credentials failed the health check", method.name)
+		}
 	}
 
 	if config.AwaitConnection {
@@ -772,54 +797,162 @@ func findCredentialsFromLockfile(config *Config) (*Credentials, error) {
 	return nil, fmt.Errorf("no valid lockfile found in any of the possible locations")
 }
 
-func findCredentialsFromProcess(config *Config) (*Credentials, error) {
-	var cmd *exec.Cmd
-	var processPath string
+// ProcessInfo describes one running LeagueClientUx process.
+type ProcessInfo struct {
+	// Cmdline is the full command line, which carries --app-port and
+	// --remoting-auth-token.
+	Cmdline string
+	// Exe is the absolute path to the executable, used to locate the install.
+	Exe string
+}
 
-	switch runtime.GOOS {
-	case "windows":
-		cmd = exec.Command("wmic", "PROCESS", "WHERE", "name='LeagueClientUx.exe'", "GET", "commandline")
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			HideWindow: true,
-		}
-	case "darwin":
-		cmd = exec.Command("ps", "-A", "-o", "command", "|", "grep", "LeagueClientUx")
-	default:
-		return nil, fmt.Errorf("unsupported platform: %s", runtime.GOOS)
-	}
+// ProcessLister lists the running LeagueClientUx processes. Faked in tests so
+// credential discovery can run without a League Client.
+type ProcessLister interface {
+	LeagueUxProcesses() ([]ProcessInfo, error)
+}
 
-	output, err := cmd.Output()
+// gopsutilLister reads the process table through gopsutil, which uses the
+// native OS APIs rather than shelling out to an external tool.
+type gopsutilLister struct{}
+
+func (gopsutilLister) LeagueUxProcesses() ([]ProcessInfo, error) {
+	procs, err := gopsutilprocess.Processes()
 	if err != nil {
 		return nil, err
 	}
 
-	// Extract the process path from the output
-	outputStr := string(output)
-	if runtime.GOOS == "windows" {
-		// For Windows, the path is in the commandline output
-		pathRegex := regexp.MustCompile(`"([^"]+\\LeagueClientUx\.exe)"`)
-		if matches := pathRegex.FindStringSubmatch(outputStr); len(matches) > 1 {
-			processPath = matches[1]
+	var found []ProcessInfo
+	for _, p := range procs {
+		name, err := p.Name()
+		if err != nil {
+			// Processes can exit between listing and inspection; skip them
+			// rather than failing the whole scan.
+			continue
 		}
-	} else if runtime.GOOS == "darwin" {
-		// For macOS, the path is in the ps output
-		pathRegex := regexp.MustCompile(`/Applications/League of Legends\.app/Contents/LoL/LeagueClientUx`)
-		if matches := pathRegex.FindStringSubmatch(outputStr); len(matches) > 0 {
-			processPath = matches[0]
+		if !isLeagueUx(name) {
+			continue
 		}
+
+		// Read the command line only for the match. On Windows it costs a
+		// read of the target process's memory, so it is not worth doing for
+		// every process on the machine.
+		cmdline, err := p.Cmdline()
+		if err != nil {
+			cmdline = ""
+		}
+		exe, err := p.Exe()
+		if err != nil {
+			exe = ""
+		}
+		found = append(found, ProcessInfo{Cmdline: cmdline, Exe: exe})
+	}
+	return found, nil
+}
+
+// leagueUxProcessName is the League Client Ux executable.
+const leagueUxProcessName = "LeagueClientUx.exe"
+
+// isLeagueUx reports whether a process is the League Client's Ux process.
+func isLeagueUx(name string) bool {
+	return strings.EqualFold(name, leagueUxProcessName)
+}
+
+func findCredentialsFromProcess(config *Config) (*Credentials, error) {
+	lister := config.ProcessLister
+	if lister == nil {
+		lister = gopsutilLister{}
 	}
 
-	// If we found the process path, update the config's LeaguePath
-	if processPath != "" {
-		// Get the directory containing LeagueClientUx.exe
-		leagueDir := filepath.Dir(processPath)
-		if config.Debug {
-			config.Logger.Debug("process", "Found League installation at: %s", leagueDir)
-		}
-		config.LeaguePath = leagueDir
+	procs, err := lister.LeagueUxProcesses()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list processes: %w", err)
+	}
+	if len(procs) == 0 {
+		return nil, fmt.Errorf("no LeagueClientUx process is running")
 	}
 
-	return parseProcessOutput(outputStr)
+	for _, proc := range procs {
+		creds, err := parseProcessOutput(proc.Cmdline)
+		if err != nil {
+			continue
+		}
+
+		// Back-fill the install directory so the lockfile fallback can find
+		// a non-default install instead of guessing drive letters.
+		if dir := leagueDirFromProcess(proc); dir != "" {
+			if config.Debug {
+				config.Logger.Debug("process", "Found League installation at: %s", dir)
+			}
+			config.LeaguePath = dir
+		}
+		return creds, nil
+	}
+
+	return nil, fmt.Errorf("failed to extract credentials from process")
+}
+
+// leagueDirFromProcess returns the League installation directory, or "" if
+// the process reveals neither the flag, its executable, nor a usable path.
+func leagueDirFromProcess(proc ProcessInfo) string {
+	// The client states its own install root, which beats inferring one.
+	if dir := installDirFromCmdline(proc.Cmdline); dir != "" {
+		return dir
+	}
+	if proc.Exe != "" {
+		return filepath.Dir(proc.Exe)
+	}
+	if exe := commandLineExe(proc.Cmdline); exe != "" {
+		return filepath.Dir(exe)
+	}
+	return ""
+}
+
+// installDirFromCmdline returns the value of --install-directory. The client
+// quotes every argument, so a quote ends the value; a bare flag ends it too.
+func installDirFromCmdline(cmdline string) string {
+	const flag = "--install-directory="
+	i := strings.Index(cmdline, flag)
+	if i < 0 {
+		return ""
+	}
+	rest := cmdline[i+len(flag):]
+
+	end := len(rest)
+	if q := strings.IndexByte(rest, '"'); q >= 0 && q < end {
+		end = q
+	}
+	if next := strings.Index(rest, " --"); next >= 0 && next < end {
+		end = next
+	}
+	return strings.TrimSpace(rest[:end])
+}
+
+// commandLineExe returns the executable at the head of a command line, which
+// Windows quotes when the path contains spaces.
+func commandLineExe(cmdline string) string {
+	cmdline = strings.TrimSpace(cmdline)
+	if cmdline == "" {
+		return ""
+	}
+
+	var exe string
+	if cmdline[0] == '"' {
+		end := strings.Index(cmdline[1:], `"`)
+		if end < 0 {
+			return ""
+		}
+		exe = cmdline[1 : 1+end]
+	} else if i := strings.IndexByte(cmdline, ' '); i >= 0 {
+		exe = cmdline[:i]
+	} else {
+		exe = cmdline
+	}
+
+	if !strings.Contains(strings.ToLower(exe), "leagueclientux") {
+		return ""
+	}
+	return exe
 }
 
 func parseProcessOutput(output string) (*Credentials, error) {
@@ -888,18 +1021,23 @@ func waitForCredentials(config *Config) (*Credentials, error) {
 	logger.Debug("connection", "Starting to wait for LCU credentials...")
 
 	for range ticker.C {
-		creds, err := findCredentialsFromProcess(config)
-		if err != nil {
-			logger.Debug("connection", "Failed to find credentials: %v", err)
-			continue
-		}
+		// Both methods are retried every tick. Either can be the only one
+		// that works: a non-default install defeats the lockfile paths, and a
+		// restricted process table defeats the process scan.
+		for _, method := range credentialMethods {
+			creds, err := method.find(config)
+			if err != nil {
+				logger.Debug("connection", "%s discovery failed: %v", method.name, err)
+				continue
+			}
 
-		logger.Debug("connection", "Found credentials on port %d, checking health...", creds.Port)
-		if checkLCUHealth(creds, config.Timeout, logger) {
-			logger.Debug("connection", "Health check passed, LCU is ready")
-			return creds, nil
+			logger.Debug("connection", "Found credentials on port %d via %s, checking health...", creds.Port, method.name)
+			if checkLCUHealth(creds, config.Timeout, logger) {
+				logger.Debug("connection", "Health check passed, LCU is ready")
+				return creds, nil
+			}
+			logger.Debug("connection", "Health check failed for %s credentials", method.name)
 		}
-		logger.Debug("connection", "Health check failed, continuing to wait...")
 	}
 	return nil, fmt.Errorf("failed to find credentials after waiting")
 }
