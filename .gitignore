@@ -43,3 +43,6 @@ debug.test
 # Environment files
 .env
 .env.local 
+
+# Local Claude notes (not committed)
+CLAUDE.local.md
