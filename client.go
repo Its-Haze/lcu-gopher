@@ -979,6 +979,10 @@ func parseProcessOutput(output string) (*Credentials, error) {
 }
 
 // checkLCUHealth verifies if the LCU API is ready to accept connections
+// healthEndpoint answers as soon as the client is up, with no logged-in
+// summoner required, so the login screen is not mistaken for a dead client.
+const healthEndpoint = "/riotclient/region-locale"
+
 func checkLCUHealth(creds *Credentials, timeout time.Duration, logger Logger) bool {
 	client := &http.Client{
 		Timeout: timeout,
@@ -989,7 +993,7 @@ func checkLCUHealth(creds *Credentials, timeout time.Duration, logger Logger) bo
 		},
 	}
 
-	url := fmt.Sprintf("https://127.0.0.1:%d/lol-summoner/v1/current-summoner", creds.Port)
+	url := fmt.Sprintf("https://127.0.0.1:%d%s", creds.Port, healthEndpoint)
 	logger.Debug("health", "Attempting health check at %s", url)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -1008,7 +1012,9 @@ func checkLCUHealth(creds *Credentials, timeout time.Duration, logger Logger) bo
 	}
 	resp.Body.Close()
 
-	success := resp.StatusCode == http.StatusOK
+	// Any answer but an auth rejection proves the API is up on these
+	// credentials; a stale lockfile fails the dial above instead.
+	success := resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden
 	logger.Debug("health", "Health check response status: %d", resp.StatusCode)
 	return success
 }

@@ -2,8 +2,15 @@ package lcu
 
 import (
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 // fakeLister stands in for the OS process table.
@@ -247,4 +254,94 @@ func TestLeagueDirPrefersTheInstallFlag(t *testing.T) {
 	if got, want := leagueDirFromProcess(proc), `C:\Riot Games\League of Legends`; got != want {
 		t.Errorf("leagueDirFromProcess() = %q, want %q", got, want)
 	}
+}
+
+// TestCheckLCUHealth covers the login-screen regression: the client answers
+// on these credentials, so it is alive even with no summoner logged in.
+func TestCheckLCUHealth(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		want   bool
+	}{
+		{"a logged-in client answers 200", http.StatusOK, true},
+		{"the login screen is still a live client", http.StatusNotFound, true},
+		{"stale credentials are rejected", http.StatusUnauthorized, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPath string
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(tt.status)
+			}))
+			defer srv.Close()
+
+			creds := &Credentials{Port: serverPort(t, srv), Password: "token", Protocol: "https"}
+			if got := checkLCUHealth(creds, 5*time.Second, &defaultLogger{}); got != tt.want {
+				t.Errorf("checkLCUHealth() = %v, want %v", got, tt.want)
+			}
+			if gotPath != healthEndpoint {
+				t.Errorf("probed %q, want %q", gotPath, healthEndpoint)
+			}
+		})
+	}
+}
+
+// serverPort extracts the port a test server is listening on.
+func serverPort(t *testing.T, srv *httptest.Server) int {
+	t.Helper()
+	_, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
+	if err != nil {
+		t.Fatalf("split test server URL %q: %v", srv.URL, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse test server port %q: %v", portStr, err)
+	}
+	return port
+}
+
+// TestFindCredentialsAcceptsALoggedOutClient is the regression this endpoint
+// change exists for: v3 connected at the login screen and v4 did not.
+func TestFindCredentialsAcceptsALoggedOutClient(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// What a client with nobody logged in answers on a session endpoint.
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	port := serverPort(t, srv)
+
+	config := DefaultConfig()
+	config.Timeout = 5 * time.Second
+	config.ProcessLister = fakeLister{procs: []ProcessInfo{{Cmdline: uxCmdline(port)}}}
+
+	creds, err := findCredentials(config)
+	if err != nil {
+		t.Fatalf("findCredentials() failed on a live but logged-out client: %v", err)
+	}
+	if creds.Port != port {
+		t.Errorf("Port = %d, want %d", creds.Port, port)
+	}
+}
+
+// TestFindCredentialsRejectsADeadClient keeps the reason the health check
+// exists: a crashed client's leftover credentials must not be accepted.
+func TestFindCredentialsRejectsADeadClient(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	port := serverPort(t, srv)
+	srv.Close() // the client is gone; nothing answers on its port any more
+
+	config := DefaultConfig()
+	config.Timeout = 2 * time.Second
+	config.ProcessLister = fakeLister{procs: []ProcessInfo{{Cmdline: uxCmdline(port)}}}
+
+	if _, err := findCredentials(config); err == nil {
+		t.Fatal("findCredentials() accepted credentials no client is answering on")
+	}
+}
+
+// uxCmdline is a LeagueClientUx command line pointed at a test server's port.
+func uxCmdline(port int) string {
+	return fmt.Sprintf(`"C:\Riot Games\League of Legends\LeagueClientUx.exe" --app-port=%d --remoting-auth-token=xY-9_tokenZ`, port)
 }
